@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-S3 多重AI辨識串流</title>
+    <!-- 引入 Tailwind CSS 進行快速排版 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 確保重疊的 Canvas 不會影響滑鼠事件 */
+        #overlay {
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center p-6 font-sans">
+
+    <div class="max-w-5xl w-full">
+        <h1 class="text-3xl font-bold text-center mb-2 text-blue-400">ESP32-S3 多重 AI 辨識</h1>
+        <p class="text-center text-gray-400 mb-8">結合 MJPEG 串流與 MediaPipe 手部、姿勢、人臉辨識</p>
+
+        <!-- 控制面板 -->
+        <div class="bg-gray-800 p-6 rounded-xl shadow-lg mb-8 flex flex-col sm:flex-row gap-4 items-end justify-center">
+            <div class="flex-1 max-w-xs">
+                <label for="ipInput" class="block text-sm font-medium text-gray-400 mb-1">ESP32 IP 位址</label>
+                <input type="text" id="ipInput" value="192.168.0.39" 
+                    class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none text-white placeholder-gray-500" 
+                    placeholder="例如: 192.168.0.39">
+            </div>
+            <button id="connectBtn" disabled
+                class="px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 text-white font-semibold rounded-lg transition-colors shadow-md w-40">
+                載入模型中...
+            </button>
+        </div>
+
+        <!-- 狀態與提示 -->
+        <div id="status" class="text-center text-sm text-yellow-400 mb-4 h-6 font-medium">
+            正在初始化 AI 模型，請稍候...
+        </div>
+
+        <!-- 影像顯示區域 (Relative 定位，讓 Canvas 能夠精準覆蓋在 Img 上方) -->
+        <div class="flex justify-center">
+            <div class="relative inline-block border-4 border-gray-700 rounded-xl overflow-hidden bg-black shadow-2xl">
+                <!-- 跨網域設定 crossorigin="anonymous" 確保 Canvas 能讀取像素 -->
+                <img id="stream" crossorigin="anonymous" alt="等待連線..." 
+                    class="block w-full max-w-3xl h-auto min-h-[480px] object-cover bg-gray-900 text-center text-gray-500 flex items-center justify-center">
+                
+                <!-- 繪製骨架的 Canvas -->
+                <canvas id="overlay" class="absolute top-0 left-0 w-full h-full"></canvas>
+            </div>
+        </div>
+        
+        <div class="mt-8 text-center text-gray-500 text-sm">
+            <p>※ 提示：模型載入完成後，將在 3 秒後自動嘗試連線。</p>
+            <p>若出現 CORS 錯誤，請確認 ESP32 程式碼已加入 <code>Access-Control-Allow-Origin: *</code> 標頭。</p>
+        </div>
+    </div>
+
+    <!-- 採用 ES Module 方式載入 MediaPipe Tasks Vision -->
+    <script type="module">
+        import {
+            HandLandmarker,
+            PoseLandmarker,
+            FaceLandmarker,
+            FilesetResolver,
+            DrawingUtils
+        } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+        const ipInput = document.getElementById('ipInput');
+        const connectBtn = document.getElementById('connectBtn');
+        const streamImg = document.getElementById('stream');
+        const canvas = document.getElementById('overlay');
+        const ctx = canvas.getContext('2d');
+        const statusText = document.getElementById('status');
+
+        let handLandmarker = undefined;
+        let poseLandmarker = undefined;
+        let faceLandmarker = undefined;
+        let isStreaming = false;
+        let drawingUtils = new DrawingUtils(ctx);
+        let animationFrameId = null;
+        let autoConnectTimeout = null;
+
+        // 1. 初始化所有 MediaPipe 模型
+        async function initModels() {
+            try {
+                statusText.innerText = "正在下載 AI 模型檔案 (1/3: 手部)...";
+                const vision = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+                );
+                
+                // --- 手部模型 ---
+                handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                        delegate: "GPU"
+                    },
+                    runningMode: "IMAGE",
+                    numHands: 2,
+                    minHandDetectionConfidence: 0.5,
+                    minHandPresenceConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+
+                statusText.innerText = "正在下載 AI 模型檔案 (2/3: 姿勢/手臂)...";
+                // --- 姿勢模型 (Lite 版以維持效能) ---
+                poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task`,
+                        delegate: "GPU"
+                    },
+                    runningMode: "IMAGE",
+                    numPoses: 1,
+                    minPoseDetectionConfidence: 0.5,
+                    minPosePresenceConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+
+                statusText.innerText = "正在下載 AI 模型檔案 (3/3: 人臉)...";
+                // --- 人臉模型 ---
+                faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+                        delegate: "GPU"
+                    },
+                    runningMode: "IMAGE",
+                    numFaces: 1,
+                    minFaceDetectionConfidence: 0.5,
+                    minFacePresenceConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+
+                statusText.innerText = "所有模型載入完成！3 秒後自動連線...";
+                statusText.className = "text-center text-sm text-green-400 mb-4 h-6 font-medium";
+                connectBtn.innerText = "連線與辨識";
+                connectBtn.disabled = false;
+
+                // --- 自動連線邏輯 ---
+                autoConnectTimeout = setTimeout(() => {
+                    if (!isStreaming && !connectBtn.disabled) {
+                        console.log("觸發自動連線...");
+                        connectBtn.click();
+                    }
+                }, 3000);
+
+            } catch (error) {
+                console.error("模型載入失敗:", error);
+                statusText.innerText = "模型載入失敗，請檢查網路連線或稍後再試。";
+                statusText.className = "text-center text-sm text-red-400 mb-4 h-6 font-medium";
+            }
+        }
+
+        // 2. 處理連線邏輯
+        connectBtn.addEventListener('click', () => {
+            // 清除可能存在的自動連線排程
+            if (autoConnectTimeout) clearTimeout(autoConnectTimeout);
+
+            const ip = ipInput.value.trim();
+            if (!ip) {
+                alert("請輸入有效的 IP 位址！");
+                return;
+            }
+
+            if (isStreaming) {
+                // 停止串流
+                isStreaming = false;
+                streamImg.src = "";
+                connectBtn.innerText = "連線與辨識";
+                connectBtn.classList.replace('bg-red-600', 'bg-blue-600');
+                connectBtn.classList.replace('hover:bg-red-500', 'hover:bg-blue-500');
+                statusText.innerText = "已停止連線。";
+                statusText.className = "text-center text-sm text-yellow-400 mb-4 h-6 font-medium";
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            } else {
+                // 開始串流
+                const streamUrl = `http://${ip}/`;
+                streamImg.src = streamUrl;
+                isStreaming = true;
+                
+                connectBtn.innerText = "停止連線";
+                connectBtn.classList.replace('bg-blue-600', 'bg-red-600');
+                connectBtn.classList.replace('hover:bg-blue-500', 'hover:bg-red-500');
+                statusText.innerText = `正在連線至 ${streamUrl} ...`;
+                statusText.className = "text-center text-sm text-yellow-400 mb-4 h-6 font-medium";
+                
+                // 開始辨識迴圈
+                detectLoop();
+            }
+        });
+
+        // 3. 影像辨識主迴圈
+        async function detectLoop() {
+            if (!isStreaming) return;
+
+            // 確保圖片已經載入並且有實際大小
+            if (streamImg.complete && streamImg.naturalWidth > 0) {
+                
+                // 調整 Canvas 解析度與圖片顯示大小一致
+                if (canvas.width !== streamImg.clientWidth || canvas.height !== streamImg.clientHeight) {
+                    canvas.width = streamImg.clientWidth;
+                    canvas.height = streamImg.clientHeight;
+                }
+
+                try {
+                    // --- 執行所有辨識 ---
+                    const handResults = handLandmarker.detect(streamImg);
+                    const poseResults = poseLandmarker.detect(streamImg);
+                    const faceResults = faceLandmarker.detect(streamImg);
+
+                    // 清空上一幀的畫布
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    let statusMsg = "串流中...";
+                    let detectedCount = 0;
+
+                    // --- 繪製姿勢 (手臂/身體) ---
+                    if (poseResults.landmarks && poseResults.landmarks.length > 0) {
+                        for (const landmarks of poseResults.landmarks) {
+                            // 身體連接線 (藍色)
+                            drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
+                                color: "#00BFFF", lineWidth: 3
+                            });
+                            // 身體關鍵點 (黃色)
+                            drawingUtils.drawLandmarks(landmarks, {
+                                color: "#FFD700", lineWidth: 2, radius: 3
+                            });
+                        }
+                        detectedCount++;
+                        statusMsg = `已偵測: 姿勢`;
+                    }
+
+                    // --- 繪製手部 ---
+                    if (handResults.landmarks && handResults.landmarks.length > 0) {
+                        for (const landmarks of handResults.landmarks) {
+                            // 手指連接線 (綠色)
+                            drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, {
+                                color: "#00FF00", lineWidth: 3
+                            });
+                            // 手指關鍵點 (紅色)
+                            drawingUtils.drawLandmarks(landmarks, {
+                                color: "#FF0000", lineWidth: 2, radius: 3
+                            });
+                        }
+                        statusMsg += (detectedCount > 0 ? ", " : "已偵測: ") + `手部(${handResults.landmarks.length})`;
+                        detectedCount++;
+                    }
+
+                    // --- 繪製人臉 ---
+                    if (faceResults.faceLandmarks && faceResults.faceLandmarks.length > 0) {
+                        for (const landmarks of faceResults.faceLandmarks) {
+                            // 人臉網格 (白色半透明)
+                            drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_CONNECTIONS, {
+                                color: "rgba(255, 255, 255, 0.3)", lineWidth: 1
+                            });
+                        }
+                        statusMsg += (detectedCount > 0 ? ", " : "已偵測: ") + `人臉`;
+                    }
+
+                    if (detectedCount === 0) {
+                        statusText.innerText = "串流中... 未偵測到目標";
+                    } else {
+                        statusText.innerText = statusMsg;
+                    }
+                    statusText.className = "text-center text-sm text-green-400 mb-4 h-6 font-medium";
+
+                } catch (error) {
+                    console.error("辨識錯誤:", error);
+                    // 若發生跨網域安全錯誤 (SecurityError)，停止迴圈並提示
+                    if (error.name === "SecurityError" || error.message.includes("Tainted")) {
+                        statusText.innerText = "CORS 跨網域錯誤！請檢查 ESP32 程式碼設定。";
+                        statusText.className = "text-center text-sm text-red-500 mb-4 h-6 font-bold";
+                        isStreaming = false;
+                        connectBtn.innerText = "發生錯誤";
+                        connectBtn.classList.replace('bg-red-600', 'bg-blue-600');
+                        connectBtn.classList.replace('hover:bg-red-500', 'hover:bg-blue-500');
+                        return; // 中斷迴圈
+                    }
+                }
+            }
+
+            // 使用 requestAnimationFrame 讓瀏覽器在下一次重繪時呼叫，達到順暢的 FPS
+            if (isStreaming) {
+                animationFrameId = requestAnimationFrame(detectLoop);
+            }
+        }
+
+        // 啟動時載入所有模型
+        initModels();
+
+    </script>
+</body>
+</html>
